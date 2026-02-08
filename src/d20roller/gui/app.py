@@ -1,4 +1,10 @@
-"""Main Tk application for the D20roller pixel-art GUI."""
+"""Main Tk application for the D20roller pixel-art GUI.
+
+Animation pipeline:
+  IDLE  ──click/shake──>  TUMBLE  ──frames done──>  SETTLE  ──hold──>  REVEAL  ──>  IDLE
+                                                                        ↑
+                               (pending roll queued if user clicks during animation)
+"""
 
 from __future__ import annotations
 
@@ -16,18 +22,27 @@ from d20roller.gui.render import (
     FRAME_SIZE,
     HISTORY_BG,
     TEXT_COLOR,
-    generate_roll_animation_frames,
+    generate_bounce_frames,
+    generate_tumble_frames,
     pil_to_photoimage,
     render_idle_die,
+    render_settle_frame,
 )
 from d20roller.roller import RollResult, roll
 
-# ---------- constants ----------
+# ---------- window constants ----------
 WINDOW_TITLE = "D20 Roller"
 WINDOW_WIDTH = 480
 WINDOW_HEIGHT = 620
-ANIM_FRAME_MS = 40  # ~25 fps
 MAX_HISTORY = 10
+
+# ---------- animation tuning (all in milliseconds) ----------
+TUMBLE_FRAMES = 14  # number of random-face frames
+TUMBLE_FRAME_MS = 35  # ms per tumble frame (~28 fps), ramped up at tail
+SETTLE_MS = 120  # ms to hold the final face before revealing text
+REVEAL_FRAME_MS = 45  # ms per bounce frame
+COOLDOWN_MS = 700  # minimum gap between rolls (handled by ShakeDetector)
+BOUNCE_SCALE = 1.08  # peak bounce scale factor (used by render)
 
 
 def _rgb(color: tuple[int, int, int]) -> str:
@@ -43,9 +58,11 @@ GOLD_HEX = _rgb((244, 180, 27))
 IDLE_HEX = _rgb(DIE_FILL_IDLE)
 
 
-class State(enum.Enum):
+class Phase(enum.Enum):
     IDLE = "idle"
-    ROLLING = "rolling"
+    TUMBLE = "tumble"
+    SETTLE = "settle"
+    REVEAL = "reveal"
 
 
 class RollMode(enum.Enum):
@@ -71,7 +88,7 @@ class D20App:
         self.root.configure(bg=BG_HEX)
         self.root.resizable(False, False)
 
-        self.state = State.IDLE
+        self.phase = Phase.IDLE
         self.mode = RollMode.NORMAL
         self.history: list[HistoryEntry] = []
         self.shake = ShakeDetector()
@@ -79,8 +96,10 @@ class D20App:
         # Animation state
         self._anim_frames: list = []
         self._anim_index: int = 0
-        self._anim_after_id: str | None = None
+        self._after_id: str | None = None
         self._pending_result: RollResult | None = None
+        self._pending_max_face: int = 20
+        self._queued_roll: bool = False  # user clicked during animation
 
         # Keep references to PhotoImages to prevent GC
         self._photo_refs: list = []
@@ -88,7 +107,7 @@ class D20App:
         self._build_ui()
         self._show_idle_die()
 
-    # ---- UI construction ----
+    # ------------------------------------------------------------------ UI
 
     def _build_ui(self) -> None:
         # --- expression input row ---
@@ -116,7 +135,7 @@ class D20App:
             bd=4,
         )
         self.expr_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.expr_entry.bind("<Return>", lambda _e: self._do_roll())
+        self.expr_entry.bind("<Return>", lambda _e: self._request_roll())
 
         # --- mode toggle row ---
         mode_frame = tk.Frame(self.root, bg=BG_HEX)
@@ -155,12 +174,11 @@ class D20App:
             anchor=tk.CENTER,
         )
 
-        # Click to roll
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<B1-Motion>", self._on_motion)
 
-        # --- result label ---
+        # --- result label (hidden during tumble+settle) ---
         self.result_var = tk.StringVar(value="Click the die to roll!")
         self.result_label = tk.Label(
             self.root,
@@ -183,14 +201,13 @@ class D20App:
         self.detail_label.pack(pady=(0, 8))
 
         # --- history listbox ---
-        hist_label = tk.Label(
+        tk.Label(
             self.root,
             text="History",
             bg=BG_HEX,
             fg=GOLD_HEX,
             font=("TkFixedFont", 10, "bold"),
-        )
-        hist_label.pack(anchor=tk.W, padx=20)
+        ).pack(anchor=tk.W, padx=20)
 
         self.history_box = tk.Listbox(
             self.root,
@@ -205,11 +222,10 @@ class D20App:
         )
         self.history_box.pack(padx=20, pady=(2, 12), fill=tk.X)
 
-    # ---- mode switching ----
+    # ------------------------------------------------------------- mode
 
     def _set_mode(self, mode: RollMode) -> None:
         self.mode = mode
-        # Update expression to match mode preset if it was a simple d20 roll
         current = self.expr_var.get().strip()
         presets = {"1d20", "2d20kh1", "2d20kl1"}
         if current in presets or not current:
@@ -228,15 +244,20 @@ class D20App:
             else:
                 btn.configure(bg=IDLE_HEX, fg=TEXT_HEX)
 
-    # ---- rolling logic ----
+    # ------------------------------------------------------------- rolling
 
     def _effective_notation(self) -> str:
         return self.expr_var.get().strip() or "1d20"
 
-    def _do_roll(self) -> None:
-        if self.state == State.ROLLING:
-            return  # ignore if already animating
+    def _request_roll(self) -> None:
+        """Entry point for all roll requests (click, shake, enter key)."""
+        if self.phase != Phase.IDLE:
+            # Queue a single re-roll to execute after the current animation
+            self._queued_roll = True
+            return
+        self._do_roll()
 
+    def _do_roll(self) -> None:
         notation = self._effective_notation()
         try:
             result = roll(notation)
@@ -245,64 +266,118 @@ class D20App:
             self.detail_var.set(str(e))
             return
 
-        self._pending_result = result
-        self._start_animation(result)
-
-    def _start_animation(self, result: RollResult) -> None:
-        self.state = State.ROLLING
-
-        # Determine max face for animation (use first dice term's sides, default 20)
+        # Determine max face for animation
         max_face = 20
         for part in result.parts:
             if hasattr(part, "expr"):
                 max_face = part.expr.sides
                 break
 
-        frames = generate_roll_animation_frames(
-            final_value=result.total,
-            max_face=max_face,
-            num_frames=16,
+        self._pending_result = result
+        self._pending_max_face = max_face
+
+        # Hide previous result text while animating
+        self.result_var.set("")
+        self.detail_var.set("")
+
+        self._start_tumble()
+
+    # ======================== PHASE 1: TUMBLE ========================
+
+    def _start_tumble(self) -> None:
+        self.phase = Phase.TUMBLE
+        frames = generate_tumble_frames(
+            max_face=self._pending_max_face,
+            num_frames=TUMBLE_FRAMES,
         )
-
-        self._photo_refs.clear()
-        self._anim_frames = []
-        for f in frames:
-            photo = pil_to_photoimage(f)
-            self._photo_refs.append(photo)
-            self._anim_frames.append(photo)
-
+        self._load_photo_frames(frames)
         self._anim_index = 0
-        self._tick_animation()
+        self._tick_tumble()
 
-    def _tick_animation(self) -> None:
+    def _tick_tumble(self) -> None:
         if self._anim_index >= len(self._anim_frames):
-            self._finish_animation()
+            self._start_settle()
             return
 
-        photo = self._anim_frames[self._anim_index]
-        self.canvas.itemconfigure(self._die_image_id, image=photo)
+        self.canvas.itemconfigure(self._die_image_id, image=self._anim_frames[self._anim_index])
         self._anim_index += 1
 
-        # Speed ramp: start fast, slow down towards the end
+        # Speed ramp: fast at start, slowing toward the end
         remaining = len(self._anim_frames) - self._anim_index
         if remaining > 8:
-            delay = 30
+            delay = TUMBLE_FRAME_MS
         elif remaining > 4:
-            delay = 50
+            delay = TUMBLE_FRAME_MS + 15
         else:
-            delay = 80
+            delay = TUMBLE_FRAME_MS + 35
 
-        self._anim_after_id = self.root.after(delay, self._tick_animation)
+        self._after_id = self.root.after(delay, self._tick_tumble)
 
-    def _finish_animation(self) -> None:
-        self.state = State.IDLE
+    # ======================== PHASE 2: SETTLE ========================
+
+    def _start_settle(self) -> None:
+        self.phase = Phase.SETTLE
         result = self._pending_result
         if result is None:
+            self._go_idle()
             return
 
-        total = result.total
+        settle_img = render_settle_frame(result.total, self._pending_max_face)
+        photo = pil_to_photoimage(settle_img)
+        self._photo_refs = [photo]
+        self.canvas.itemconfigure(self._die_image_id, image=photo)
 
-        # Colour the result based on nat 20 / nat 1
+        # Hold the settled frame for SETTLE_MS, then reveal
+        self._after_id = self.root.after(SETTLE_MS, self._start_reveal)
+
+    # ======================== PHASE 3: REVEAL ========================
+
+    def _start_reveal(self) -> None:
+        self.phase = Phase.REVEAL
+        result = self._pending_result
+        if result is None:
+            self._go_idle()
+            return
+
+        # Show the result text now
+        self._show_result_text(result)
+
+        # Generate bounce frames and play them
+        frames = generate_bounce_frames(result.total, self._pending_max_face)
+        self._load_photo_frames(frames)
+        self._anim_index = 0
+        self._tick_reveal()
+
+    def _tick_reveal(self) -> None:
+        if self._anim_index >= len(self._anim_frames):
+            self._finish_reveal()
+            return
+
+        self.canvas.itemconfigure(self._die_image_id, image=self._anim_frames[self._anim_index])
+        self._anim_index += 1
+        self._after_id = self.root.after(REVEAL_FRAME_MS, self._tick_reveal)
+
+    def _finish_reveal(self) -> None:
+        result = self._pending_result
+        if result is not None:
+            now = datetime.datetime.now().strftime("%H:%M:%S")
+            entry = HistoryEntry(timestamp=now, expression=result.parsed.raw, result=result)
+            self.history.insert(0, entry)
+            if len(self.history) > MAX_HISTORY:
+                self.history = self.history[:MAX_HISTORY]
+            self._refresh_history()
+
+        self._go_idle()
+
+        # Execute queued roll if the user clicked during animation
+        if self._queued_roll:
+            self._queued_roll = False
+            self._do_roll()
+
+    # ------------------------------------------------------------- helpers
+
+    def _show_result_text(self, result: RollResult) -> None:
+        total = result.total
         is_nat20 = False
         is_nat1 = False
         for part in result.parts:
@@ -325,13 +400,18 @@ class D20App:
 
         self.detail_var.set(str(result))
 
-        # Add to history
-        now = datetime.datetime.now().strftime("%H:%M:%S")
-        entry = HistoryEntry(timestamp=now, expression=result.parsed.raw, result=result)
-        self.history.insert(0, entry)
-        if len(self.history) > MAX_HISTORY:
-            self.history = self.history[:MAX_HISTORY]
-        self._refresh_history()
+    def _go_idle(self) -> None:
+        self.phase = Phase.IDLE
+        self._pending_result = None
+
+    def _load_photo_frames(self, pil_frames: list) -> None:
+        """Convert PIL Images to PhotoImages and store refs."""
+        self._photo_refs.clear()
+        self._anim_frames = []
+        for f in pil_frames:
+            photo = pil_to_photoimage(f)
+            self._photo_refs.append(photo)
+            self._anim_frames.append(photo)
 
     def _refresh_history(self) -> None:
         self.history_box.delete(0, tk.END)
@@ -345,26 +425,25 @@ class D20App:
         self._photo_refs = [photo]
         self.canvas.itemconfigure(self._die_image_id, image=photo)
 
-    # ---- mouse input handlers ----
+    # ------------------------------------------------------------- input
 
     def _on_press(self, event: tk.Event) -> None:
-        if self.state == State.ROLLING:
+        if self.phase != Phase.IDLE:
+            self._queued_roll = True
             return
         self.shake.press()
 
     def _on_release(self, event: tk.Event) -> None:
         was_pressed = self.shake.is_pressed
         self.shake.release()
-        # Simple click (press + release without triggering shake) = roll
-        if was_pressed and self.state == State.IDLE:
-            self._do_roll()
+        if was_pressed and self.phase == Phase.IDLE:
+            self._request_roll()
 
     def _on_motion(self, event: tk.Event) -> None:
-        if self.state == State.ROLLING:
+        if self.phase != Phase.IDLE:
             return
         if self.shake.feed(event.x, event.y):
-            # Shake triggered a roll
-            self._do_roll()
+            self._request_roll()
 
 
 def main() -> None:

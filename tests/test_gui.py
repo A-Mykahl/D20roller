@@ -6,9 +6,13 @@ from PIL import Image
 
 from d20roller.gui.input import ShakeDetector
 from d20roller.gui.render import (
+    FRAME_SIZE,
+    generate_bounce_frames,
     generate_roll_animation_frames,
+    generate_tumble_frames,
     render_die_frame,
     render_idle_die,
+    render_settle_frame,
 )
 
 
@@ -33,6 +37,58 @@ class TestRender:
         fail = render_die_frame(1, is_fail=True)
         assert crit.size == (160, 160)
         assert fail.size == (160, 160)
+
+    def test_jitter_offset_renders(self):
+        img = render_die_frame(7, jitter=(2, -2))
+        assert img.size == (FRAME_SIZE, FRAME_SIZE)
+
+
+class TestTumbleFrames:
+    def test_frame_count(self):
+        frames = generate_tumble_frames(max_face=20, num_frames=14)
+        assert len(frames) == 14
+
+    def test_all_frames_are_images(self):
+        frames = generate_tumble_frames(max_face=6, num_frames=8)
+        assert all(isinstance(f, Image.Image) for f in frames)
+        assert all(f.size == (FRAME_SIZE, FRAME_SIZE) for f in frames)
+
+
+class TestSettleFrame:
+    def test_returns_image(self):
+        img = render_settle_frame(15, max_face=20)
+        assert isinstance(img, Image.Image)
+        assert img.size == (FRAME_SIZE, FRAME_SIZE)
+
+    def test_crit_value(self):
+        img = render_settle_frame(20, max_face=20)
+        assert img.size == (FRAME_SIZE, FRAME_SIZE)
+
+    def test_fail_value(self):
+        img = render_settle_frame(1, max_face=20)
+        assert img.size == (FRAME_SIZE, FRAME_SIZE)
+
+
+class TestBounceFrames:
+    def test_frame_count_matches_scales(self):
+        frames = generate_bounce_frames(12, max_face=20)
+        # Default _BOUNCE_SCALES has 5 entries
+        assert len(frames) == 5
+
+    def test_all_frames_same_size(self):
+        frames = generate_bounce_frames(12, max_face=20)
+        assert all(f.size == (FRAME_SIZE, FRAME_SIZE) for f in frames)
+
+    def test_custom_scales(self):
+        frames = generate_bounce_frames(8, max_face=20, scales=(1.0, 1.1, 1.0))
+        assert len(frames) == 3
+
+    def test_first_and_last_are_base_size(self):
+        frames = generate_bounce_frames(10, max_face=20)
+        # First and last scale are 1.0, so should be identical to the settle frame
+        base = render_settle_frame(10, max_face=20)
+        assert frames[0].size == base.size
+        assert frames[-1].size == base.size
 
 
 class TestShakeDetector:

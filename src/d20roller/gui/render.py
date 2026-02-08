@@ -20,6 +20,9 @@ HISTORY_BG = (34, 30, 50)
 
 FRAME_SIZE = 160  # px, square
 
+# ---------- animation tuning constants ----------
+JITTER_PX = 2  # max pixel offset per axis during tumble
+
 
 def _try_font(size: int) -> ImageFont.ImageFont:
     """Return a monospace / bitmap-style font, falling back to default."""
@@ -83,15 +86,13 @@ def _draw_d20_face(
         opp = ((i + 1) % 3, (i + 2) % 3)
         mx = (pts[opp[0]][0] + pts[opp[1]][0]) // 2
         my = (pts[opp[0]][1] + pts[opp[1]][1]) // 2
-        # Draw faint guide lines
         draw.line([pts[i], (mx, my)], fill=outline, width=1)
 
-    # Number text – centred at centroid (shifted up slightly)
+    # Number text -- centred at centroid (shifted up slightly)
     text = str(number)
     bbox = font.getbbox(text)
     tw = bbox[2] - bbox[0]
     th = bbox[3] - bbox[1]
-    # centroid of triangle is at (cx, cy + radius/6) roughly
     ty = cy + radius // 8
     draw.text((cx - tw // 2, ty - th // 2), text, fill=text_color, font=font)
 
@@ -103,12 +104,18 @@ def render_die_frame(
     fill: tuple[int, int, int] | None = None,
     is_crit: bool = False,
     is_fail: bool = False,
+    jitter: tuple[int, int] = (0, 0),
 ) -> Image.Image:
-    """Render a single die-face frame as a Pillow Image."""
+    """Render a single die-face frame as a Pillow Image.
+
+    Args:
+        jitter: (dx, dy) pixel offset applied to the die centre for motion effect.
+    """
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    cx, cy = size // 2, size // 2
+    cx = size // 2 + jitter[0]
+    cy = size // 2 + jitter[1]
     radius = int(size * 0.44)
 
     if fill is None:
@@ -127,18 +134,89 @@ def render_die_frame(
     return img
 
 
+# ---- Phase 1: TUMBLE frames ----
+
+
+def generate_tumble_frames(
+    max_face: int = 20,
+    num_frames: int = 14,
+    jitter_px: int = JITTER_PX,
+) -> list[Image.Image]:
+    """Random faces with small jitter offsets -- the 'entropy theatre' phase."""
+    rng = random.Random()
+    frames: list[Image.Image] = []
+    for _ in range(num_frames):
+        value = rng.randint(1, max(max_face, 1))
+        dx = rng.randint(-jitter_px, jitter_px)
+        dy = rng.randint(-jitter_px, jitter_px)
+        frames.append(render_die_frame(value, fill=DIE_FILL_ROLLING, jitter=(dx, dy)))
+    return frames
+
+
+# ---- Phase 2: SETTLE frame ----
+
+
+def render_settle_frame(
+    final_value: int,
+    max_face: int = 20,
+) -> Image.Image:
+    """The final die face at rest -- shown before the number is revealed in the UI."""
+    is_crit = final_value == max_face and max_face == 20
+    is_fail = final_value == 1 and max_face == 20
+    return render_die_frame(
+        final_value,
+        fill=DIE_FILL_RESULT,
+        is_crit=is_crit,
+        is_fail=is_fail,
+    )
+
+
+# ---- Phase 3: REVEAL bounce frames ----
+
+# Scale keyframes: up then back to 1.0
+_BOUNCE_SCALES = (1.00, 1.05, 1.08, 1.05, 1.00)
+
+
+def generate_bounce_frames(
+    final_value: int,
+    max_face: int = 20,
+    scales: tuple[float, ...] = _BOUNCE_SCALES,
+) -> list[Image.Image]:
+    """Scale the settle frame up/down with nearest-neighbour to create a bounce."""
+    base = render_settle_frame(final_value, max_face)
+    size = base.size[0]
+    frames: list[Image.Image] = []
+
+    for s in scales:
+        if s == 1.0:
+            frames.append(base)
+            continue
+        new_dim = max(1, int(size * s))
+        scaled = base.resize((new_dim, new_dim), Image.NEAREST)
+        # Centre-crop / centre-paste back to original size
+        out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        offset = (size - new_dim) // 2
+        out.paste(scaled, (offset, offset))
+        frames.append(out)
+
+    return frames
+
+
+# ---- Legacy helper (still used by old generate_roll_animation_frames callers) ----
+
+
 def generate_roll_animation_frames(
     final_value: int,
     max_face: int = 20,
     num_frames: int = 16,
 ) -> list[Image.Image]:
-    """Generate a sequence of die-face frames ending on final_value.
+    """Generate a flat sequence of die-face frames ending on final_value.
 
-    Early frames show random numbers with the rolling fill colour;
-    the last frame shows the final result with appropriate styling.
+    Kept for backward compatibility; the 3-phase pipeline in app.py now uses
+    generate_tumble_frames / render_settle_frame / generate_bounce_frames directly.
     """
     frames: list[Image.Image] = []
-    rng = random.Random()  # non-deterministic for visual flair
+    rng = random.Random()
 
     for i in range(num_frames):
         is_last = i == num_frames - 1
