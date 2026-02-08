@@ -8,9 +8,11 @@ version = "0.1.0"
 description = "A dice roller supporting standard tabletop RPG notation"
 requires-python = ">=3.10"
 license = "MIT"
+dependencies = ["Pillow>=10.0"]
 
 [project.scripts]
 d20 = "d20roller.cli:main"
+d20-gui = "d20roller.gui.app:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

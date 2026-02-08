@@ -101,18 +101,25 @@ def _roll_dice_group(term: Term, rng: random.Random) -> DiceGroupResult:
     return DiceGroupResult(expr=expr, rolls=rolls, kept=kept, sign=term.sign)
 
 
-def roll(notation: str, *, seed: int | None = None) -> RollResult:
+def roll(
+    notation: str,
+    *,
+    seed: int | None = None,
+    rng: random.Random | None = None,
+) -> RollResult:
     """Parse and roll a dice notation string.
 
     Args:
         notation: A dice notation string like '2d20+5'.
         seed: Optional RNG seed for reproducible results (useful in tests).
+        rng: Optional Random instance to use. Takes precedence over seed.
 
     Returns:
         A RollResult with individual rolls and the total.
     """
     parsed = parse(notation)
-    rng = random.Random(seed)
+    if rng is None:
+        rng = random.Random(seed)
     result = RollResult(parsed=parsed)
 
     for term in parsed.terms:
